@@ -68,6 +68,44 @@ def get_universe(include_midcap: bool = True, include_smallcap: bool = True) -> 
     return sorted(all_tickers)
 
 
+_sector_map_cache: dict[str, str] | None = None
+
+
+def get_sector_map() -> dict[str, str]:
+    """{symbol: industry}, straight from NSE's own index constituent CSVs
+    (the same ones get_universe() already reads) - not scraped.
+
+    screener.in's company page used to carry this in a `<p class="sub">`
+    element right under the company name; it doesn't anymore (checked
+    2026-09-15 against a live RELIANCE fetch - the string "sector"
+    doesn't appear anywhere in the page's HTML at all now, so that
+    element holds the "pros and cons are machine generated" disclaimer
+    instead). NSE's own CSV already carries a clean "Industry" column
+    per symbol that get_universe() was discarding - using it directly
+    is both more reliable than re-scraping a second page per ticker and
+    avoids adding any new network calls to the per-ticker fetch loop.
+
+    Cached at module level so a run that calls this more than once
+    (e.g. main.py's overlay step, on the --skip-fundamentals path where
+    get_universe() itself never ran) doesn't refetch."""
+    global _sector_map_cache
+    if _sector_map_cache is not None:
+        return _sector_map_cache
+
+    sector_map: dict[str, str] = {}
+    for name, url in NSE_INDEX_URLS.items():
+        try:
+            df = _fetch_nse_csv(url)
+            for sym, industry in zip(df["Symbol"].astype(str).str.strip(),
+                                      df["Industry"].astype(str).str.strip()):
+                sector_map[sym] = industry
+        except Exception as e:
+            print(f"  Sector map: {name} FAILED - {e}")
+
+    _sector_map_cache = sector_map
+    return sector_map
+
+
 def get_sample_tickers() -> list[str]:
     """A small hand-picked set of well-known mid/small caps for smoke tests."""
     return [

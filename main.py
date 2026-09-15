@@ -190,6 +190,24 @@ def main():
                         print(f"ERROR during scoring: {e}")
                         diagnostics["notes"].append(f"Scoring crashed: {e}")
 
+    # Sector overlay - straight from NSE's own index CSVs, not scraped.
+    # Runs regardless of which branch above produced `scored` (fresh
+    # scoring or --skip-fundamentals' cached load), and before STEP 5 so
+    # the corrected column is already in scored.csv/final.csv on disk,
+    # not just the in-memory report. See src/universe.py's
+    # get_sector_map() docstring for why: screener.in's page no longer
+    # carries sector in its static HTML at all (confirmed 2026-09-15),
+    # so the old scrape was silently writing the pros/cons disclaimer
+    # into every row's "sector" field instead.
+    if len(scored) > 0 and "symbol" in scored.columns:
+        try:
+            from src.universe import get_sector_map
+            scored["sector"] = scored["symbol"].map(get_sector_map())
+            scored.to_csv(output_dir / "scored.csv", index=False)
+        except Exception as e:
+            print(f"WARNING: sector overlay failed: {type(e).__name__}: {e}")
+            diagnostics["notes"].append(f"Sector overlay failed: {type(e).__name__}: {e}")
+
     # STEP 5: Technicals (only if we have candidates)
     if not args.skip_technicals and len(scored) > 0 and "symbol" in scored.columns:
         _cooldown(args.wait_before_technicals, label="Cooldown before technicals fetch")

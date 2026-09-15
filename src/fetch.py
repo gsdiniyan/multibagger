@@ -374,9 +374,11 @@ def scrape_screener(session, symbol: str) -> dict[str, Any]:
     if h1:
         result["name"] = _text(h1)
 
-    company_info = soup.find("p", class_="sub")
-    if company_info:
-        result["sector"] = _text(company_info)
+    # "sector" is NOT scraped here - screener.in's <p class="sub"> used to
+    # carry it but now holds the pros/cons disclaimer instead (confirmed
+    # 2026-09-15: the word "sector" doesn't appear anywhere in a live
+    # company page's HTML). main.py overlays the real sector afterward
+    # from NSE's own index CSVs (src/universe.py's get_sector_map()).
 
     try:
         result.update(_parse_top_ratios(soup))
