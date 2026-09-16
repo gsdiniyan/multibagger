@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -67,12 +68,33 @@ def _ist_now() -> datetime:
     return datetime.now(_IST_TZ)
 
 
+PREVIOUS_PICKS_PATH = OUTPUT_DIR / "previous_final.csv"
+
+
+def _snapshot_previous_picks() -> None:
+    """Copies whatever the LAST run wrote (before main.py overwrites it
+    with today's fresh output) into PREVIOUS_PICKS_PATH, so /status can
+    diff today's list against yesterday's. main.py always writes the
+    same filenames every run - there was no history at all before this,
+    which is exactly why "what changed since yesterday" couldn't be
+    shown. No-op on the very first run ever (nothing to snapshot yet)."""
+    for name in ("final.csv", "scored.csv"):
+        path = OUTPUT_DIR / name
+        if path.exists():
+            try:
+                shutil.copy2(path, PREVIOUS_PICKS_PATH)
+            except Exception as e:
+                print(f"Failed to snapshot previous picks: {e}")
+            return
+
+
 def _run_scan() -> None:
     """Runs main.py exactly as a human would from the command line, then
     records the outcome. Never raises - a scan that crashes is recorded
     as a failed run, not a dead service (the scheduler loop below keeps
     going either way)."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    _snapshot_previous_picks()
     started = _ist_now()
     print(f"[{started.isoformat()}] Starting scan -> {OUTPUT_DIR}")
     try:
@@ -129,6 +151,63 @@ def _load_run_state() -> dict:
         return {}
 
 
+_PICK_COLS = (
+    "symbol", "name", "sector", "current_price", "multibagger_score",
+    "technical_score", "supertrend_daily_signal", "supertrend_weekly_signal",
+    "roe", "roce", "promoter_holding", "rationale",
+)
+
+
+def _load_top_picks(path: Path) -> list[dict]:
+    """Same ranking/column logic _build_status() always used, factored
+    out so today's picks and yesterday's snapshot are read identically -
+    a diff comparing differently-shaped data would be misleading."""
+    if not path.exists():
+        return []
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return []
+    if df.empty:
+        return []
+    sort_col = "multibagger_score" if "multibagger_score" in df.columns else df.columns[0]
+    ranked = df.sort_values(sort_col, ascending=False)
+    cols = [c for c in _PICK_COLS if c in ranked.columns]
+    return ranked[cols].head(SCAN_TOP_N).to_dict(orient="records")
+
+
+def _diff_picks(today: list[dict], previous: list[dict]) -> dict:
+    """New symbols, dropped symbols, and score moves for symbols in both
+    lists - the actual "what changed since yesterday" a long, flat table
+    can't show on its own. Empty `previous` (no snapshot yet, e.g. the
+    very first run) yields an honest empty diff, not a misleading
+    "everything is new"."""
+    if not previous:
+        return {"new": [], "dropped": [], "moved": [], "has_previous": False}
+
+    today_by_symbol = {p.get("symbol"): p for p in today if p.get("symbol")}
+    prev_by_symbol = {p.get("symbol"): p for p in previous if p.get("symbol")}
+
+    new = [s for s in today_by_symbol if s not in prev_by_symbol]
+    dropped = [s for s in prev_by_symbol if s not in today_by_symbol]
+
+    moved = []
+    for sym, pick in today_by_symbol.items():
+        prev_pick = prev_by_symbol.get(sym)
+        if prev_pick is None:
+            continue
+        today_score, prev_score = pick.get("multibagger_score"), prev_pick.get("multibagger_score")
+        if today_score is None or prev_score is None:
+            continue
+        delta = today_score - prev_score
+        if abs(delta) >= 1:  # ignore noise-level score jitter
+            moved.append({"symbol": sym, "score_delta": round(delta, 1),
+                           "today_score": today_score, "previous_score": prev_score})
+    moved.sort(key=lambda m: abs(m["score_delta"]), reverse=True)
+
+    return {"new": new, "dropped": dropped, "moved": moved, "has_previous": True}
+
+
 def _build_status() -> dict:
     run_state = _load_run_state()
     notes: list[str] = []
@@ -160,12 +239,10 @@ def _build_status() -> dict:
     else:
         sort_col = "multibagger_score" if "multibagger_score" in df.columns else df.columns[0]
         ranked = df.sort_values(sort_col, ascending=False)
-        cols = [c for c in (
-            "symbol", "name", "sector", "current_price", "multibagger_score",
-            "technical_score", "supertrend_daily_signal", "supertrend_weekly_signal",
-            "roe", "roce", "promoter_holding", "rationale",
-        ) if c in ranked.columns]
+        cols = [c for c in _PICK_COLS if c in ranked.columns]
         top_picks = ranked[cols].head(SCAN_TOP_N).to_dict(orient="records")
+
+    previous_picks = _load_top_picks(PREVIOUS_PICKS_PATH)
 
     return {
         "project": "Multibagger",
@@ -178,6 +255,7 @@ def _build_status() -> dict:
             "notes": notes,
         },
         "top_picks": top_picks,
+        "changes": _diff_picks(top_picks, previous_picks),
     }
 
 
