@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+state/
+data/
+reports/
+engine/data/
+engine/reports/
+dhan_scrip_master.csv

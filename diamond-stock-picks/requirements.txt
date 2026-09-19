@@ -1,0 +1,8 @@
+numpy
+pandas
+requests
+yfinance
+pydantic>=2.0
+pydantic-settings>=2.0
+python-dotenv
+tzdata
