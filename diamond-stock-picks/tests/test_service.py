@@ -189,3 +189,12 @@ def test_fetch_all_loads_instrument_list_before_threads(monkeypatch):
     store = px.fetch_all(["AAA", "BBB", "CCC"], workers=2)
     assert order[0] == "master" and order.count("history") == 3
     assert store.last_date == pd.Timestamp("2026-09-19") and list(store.close.columns)[:3] == ["AAA.NS", "BBB.NS", "CCC.NS"]
+
+
+def test_engine_source_files_are_present():
+    """A too-broad .gitignore once dropped engine/diamond/data from the repo and the deploy."""
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for rel in ("data/market.py", "data/universe.py", "analysis/screener.py", "strategies/steady.py", "execution/costs.py"):
+        assert os.path.exists(os.path.join(root, "engine", "diamond", rel)), rel

@@ -2,8 +2,9 @@ __pycache__/
 *.pyc
 .env
 state/
-data/
-reports/
-engine/data/
-engine/reports/
+# runtime folders the engine creates at the service root (anchored: engine/diamond/data is source code)
+/data/
+/reports/
+/engine/data/
+/engine/reports/
 dhan_scrip_master.csv
