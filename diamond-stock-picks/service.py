@@ -18,7 +18,7 @@ ALERTS (shown on the dashboard from /status, kept in STATE_DIR/state.json)
   NEW_PICK       stock entered the list at a weekly re-screen
   DROPPED_PICK   stock left the list (high severity if you hold it)
   FUNDAMENTALS   a listed stock is rated AVOID by the fundamentals check
-  DATA_ERROR     Dhan returned no data (usually an expired DHAN_ACCESS_TOKEN)
+  DATA_ERROR     Dhan returned no data (usually an expired DHAN_ACCESS_TOKEN); cleared by the next good run
 
 CONFIG (env): DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, CAPITAL (default 500000), STOP_PCT (10),
 HOLDINGS ("DIVISLAB:3@8570,SBIN:27@990"), STOP_CHECK_MINUTES (15), STATE_DIR (attach a Railway volume there to keep
@@ -155,6 +155,8 @@ def _run_locked(reason: str, started: datetime) -> None:
     data_day = store.last_date.date().isoformat()
     st = _state.data
     price_source = "dhan daily close"
+    # a data error is a transient state: it clears itself once a run succeeds
+    st["alerts"] = [a for a in st["alerts"] if a["kind"] != "DATA_ERROR"]
 
     refresh = (not st.get("alloc")) or (started.weekday() == REFRESH_WEEKDAY and st.get("list_date") != data_day)
     if refresh:

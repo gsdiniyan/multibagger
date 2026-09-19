@@ -198,3 +198,12 @@ def test_engine_source_files_are_present():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     for rel in ("data/market.py", "data/universe.py", "analysis/screener.py", "strategies/steady.py", "execution/costs.py"):
         assert os.path.exists(os.path.join(root, "engine", "diamond", rel)), rel
+
+
+def test_data_error_clears_after_a_good_run(svc, monkeypatch, tmp_path):
+    monkeypatch.setattr(svc, "_state", al.State(str(tmp_path)))
+    monkeypatch.setenv("HOLDINGS", "")
+    svc._state.add_alert("DATA_ERROR", "-", "old failure", "2026-09-17", "high")
+    monkeypatch.setattr(svc.px, "fetch_all", lambda syms: _synthetic_store(1))
+    svc._run_locked("test", datetime(2026, 9, 21, 16, 10, tzinfo=IST))
+    assert not [a for a in svc._latest["alerts"] if a["kind"] == "DATA_ERROR"]
