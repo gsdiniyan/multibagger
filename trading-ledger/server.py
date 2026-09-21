@@ -14,6 +14,13 @@ ENDPOINTS (all except /health need the header  X-Ledger-Key: <LEDGER_API_KEY>)
   GET  /v1/signals?source=&strategy=&symbol=&kind=&action=&since=&until=&limit=   newest first, limit <= 1000
   GET  /v1/summary?days=7      counts per IST day / source / strategy / kind / action (spot a silent system);
                                rows with source='selftest' (deploy checks) are hidden unless include_test=1
+  POST /v1/outcomes            what happened to a signal, one record or a list of up to 200. A signal is named by its
+                               dedupe_key; posting the same (signal, horizon, method) again REPLACES the label (outcomes are
+                               derived data, so a corrected labeling rule can be re-run). Unknown signals are reported, not stored.
+  GET  /v1/outcomes?method=&horizon=&source=&strategy=&symbol=&action=&since=&until=&limit=
+                               labeled outcomes joined to their signal, newest first
+  GET  /v1/unlabeled?method=&horizon=&source=&strategy=&symbol=&since=&until=&limit=
+                               signals (kind=signal) that have no outcome yet for that method + horizon
 
 RECORD FIELDS
   required: source, strategy, symbol, action, dedupe_key, ts_signal (ISO-8601 WITH a timezone offset)
@@ -38,14 +45,16 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 MAX_BODY = 512 * 1024
 MAX_BATCH = 200
 MAX_JSON = 64 * 1024
 MAX_QUERY_LIMIT = 1000
 KINDS = {"signal", "rejected", "event"}
 DIRECTIONS = {"BULLISH", "BEARISH"}
-STR_LIMITS = {"source": 64, "strategy": 64, "symbol": 40, "action": 40, "dedupe_key": 240, "rule_version": 80}
+STR_LIMITS = {"source": 64, "strategy": 64, "symbol": 40, "action": 40, "dedupe_key": 240, "rule_version": 80,
+              "horizon": 40, "method": 80}
+OUTCOME_ALLOWED = {"dedupe_key", "horizon", "method", "ret_pct", "hit_target", "hit_stop", "mfe_pct", "mae_pct", "detail"}
 NUM_FIELDS = ("entry_price", "stop", "target1", "target2", "score")
 REQUIRED = ("source", "strategy", "symbol", "action", "dedupe_key", "ts_signal")
 ALLOWED = set(REQUIRED) | set(NUM_FIELDS) | {"kind", "direction", "rule_version", "features", "payload"}
@@ -104,6 +113,30 @@ def parse_ts(value) -> datetime:
     if dt > datetime.now(timezone.utc) + timedelta(days=2):
         raise ValidationError("ts_signal is in the future")
     return dt
+
+
+def _clean_bool(name: str, value):
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValidationError(f"{name} must be true, false or null")
+    return value
+
+
+def validate_outcome(obj) -> dict:
+    """A clean outcome ready to store, or ValidationError."""
+    if not isinstance(obj, dict):
+        raise ValidationError("a record must be a JSON object")
+    unknown = sorted(set(obj) - OUTCOME_ALLOWED)
+    if unknown:
+        raise ValidationError(f"unknown field(s): {', '.join(unknown)}")
+    rec = {k: _clean_str(k, obj.get(k), True) for k in ("dedupe_key", "horizon", "method")}
+    for f in ("ret_pct", "mfe_pct", "mae_pct"):
+        rec[f] = _clean_num(f, obj.get(f))
+    for f in ("hit_target", "hit_stop"):
+        rec[f] = _clean_bool(f, obj.get(f))
+    rec["detail"] = _clean_json("detail", obj.get("detail"))
+    return rec
 
 
 def validate_signal(obj) -> dict:
@@ -238,6 +271,80 @@ class PgStore:
             out.append(d)
         return out
 
+    def insert_outcomes(self, recs: list[dict]) -> list[str]:
+        """One status per record, in order: 'inserted', 'updated' (same signal + horizon + method labeled again) or 'unknown_signal'."""
+        from psycopg.types.json import Jsonb
+
+        sql = ("INSERT INTO outcomes (signal_id, horizon, method, ret_pct, hit_target, hit_stop, mfe_pct, mae_pct, detail) "
+               "SELECT id, %s, %s, %s, %s, %s, %s, %s, %s FROM signals WHERE dedupe_key = %s "
+               "ON CONFLICT (signal_id, horizon, method) DO UPDATE SET labeled_at = now(), ret_pct = EXCLUDED.ret_pct, "
+               "hit_target = EXCLUDED.hit_target, hit_stop = EXCLUDED.hit_stop, mfe_pct = EXCLUDED.mfe_pct, "
+               "mae_pct = EXCLUDED.mae_pct, detail = EXCLUDED.detail RETURNING (xmax = 0)")
+        out: list[str] = []
+        with self._conn() as c:                      # one transaction, like signals
+            for r in recs:
+                row = c.execute(sql, [r["horizon"], r["method"], r["ret_pct"], r["hit_target"], r["hit_stop"], r["mfe_pct"],
+                                      r["mae_pct"], Jsonb(r["detail"]), r["dedupe_key"]]).fetchone()
+                out.append("unknown_signal" if row is None else ("inserted" if row[0] else "updated"))
+        return out
+
+    def query_outcomes(self, filters: dict, since, until, limit: int) -> list[dict]:
+        where, args = [], []
+        for key in ("source", "strategy", "symbol", "action"):
+            if filters.get(key):
+                where.append(f"s.{key} = %s")
+                args.append(filters[key])
+        for key in ("method", "horizon"):
+            if filters.get(key):
+                where.append(f"o.{key} = %s")
+                args.append(filters[key])
+        if since:
+            where.append("s.ts_signal >= %s")
+            args.append(since)
+        if until:
+            where.append("s.ts_signal < %s")
+            args.append(until)
+        cols = ["id", "dedupe_key", "ts_signal", "source", "strategy", "symbol", "action", "direction", "rule_version", "entry_price",
+                "score", "features"]
+        ocols = ["horizon", "method", "labeled_at", "ret_pct", "hit_target", "hit_stop", "mfe_pct", "mae_pct", "detail"]
+        sql = (f"SELECT {', '.join('s.' + c for c in cols)}, {', '.join('o.' + c for c in ocols)} FROM outcomes o "
+               "JOIN signals s ON s.id = o.signal_id" + (" WHERE " + " AND ".join(where) if where else "")
+               + " ORDER BY s.ts_signal DESC, s.id DESC LIMIT %s")
+        with self._conn() as c:
+            rows = c.execute(sql, args + [limit]).fetchall()
+        out = []
+        for row in rows:
+            d = dict(zip(cols + ocols, row))
+            d["ts_signal"] = d["ts_signal"].isoformat()
+            d["labeled_at"] = d["labeled_at"].isoformat()
+            out.append(d)
+        return out
+
+    def query_unlabeled(self, filters: dict, since, until, method: str, horizon: str, limit: int) -> list[dict]:
+        where = ["kind = 'signal'", "NOT EXISTS (SELECT 1 FROM outcomes o WHERE o.signal_id = signals.id AND o.method = %s AND o.horizon = %s)"]
+        args: list = [method, horizon]
+        for key, col in _FILTERS.items():
+            if key != "kind" and filters.get(key):
+                where.append(f"{col} = %s")
+                args.append(filters[key])
+        if since:
+            where.append("ts_signal >= %s")
+            args.append(since)
+        if until:
+            where.append("ts_signal < %s")
+            args.append(until)
+        sql = f"SELECT {_SELECT} FROM signals WHERE " + " AND ".join(where) + " ORDER BY ts_signal DESC, id DESC LIMIT %s"
+        with self._conn() as c:
+            rows = c.execute(sql, args + [limit]).fetchall()
+        names = ["id", *_COLS, "ts_received"]
+        out = []
+        for row in rows:
+            d = dict(zip(names, row))
+            d["ts_signal"] = d["ts_signal"].isoformat()
+            d["ts_received"] = d["ts_received"].isoformat()
+            out.append(d)
+        return out
+
     def summary(self, days: int, include_test: bool = False) -> list[dict]:
         sql = ("SELECT (ts_signal AT TIME ZONE 'Asia/Kolkata')::date AS day, source, strategy, kind, action, count(*) "
                "FROM signals WHERE ts_signal >= now() - make_interval(days => %s) AND (%s OR source <> 'selftest') "
@@ -285,6 +392,17 @@ def make_handler(store, api_key: str):
                     since = parse_ts(q["since"]) if q.get("since") else None
                     until = parse_ts(q["until"]) if q.get("until") else None
                     return self._send(200, {"signals": store.query_signals(q, since, until, limit)})
+                if url.path in ("/v1/outcomes", "/v1/unlabeled"):
+                    limit = int(q.get("limit", 100))
+                    if not 1 <= limit <= MAX_QUERY_LIMIT:
+                        raise ValidationError(f"limit must be 1..{MAX_QUERY_LIMIT}")
+                    since = parse_ts(q["since"]) if q.get("since") else None
+                    until = parse_ts(q["until"]) if q.get("until") else None
+                    if url.path == "/v1/outcomes":
+                        return self._send(200, {"outcomes": store.query_outcomes(q, since, until, limit)})
+                    if not q.get("method") or not q.get("horizon"):
+                        raise ValidationError("method and horizon are required")
+                    return self._send(200, {"signals": store.query_unlabeled(q, since, until, q["method"], q["horizon"], limit)})
                 if url.path == "/v1/summary":
                     days = int(q.get("days", 7))
                     if not 1 <= days <= 400:
@@ -297,7 +415,8 @@ def make_handler(store, api_key: str):
             return self._send(404, {"error": "not found"})
 
         def do_POST(self):
-            if urlparse(self.path).path != "/v1/signals":
+            path = urlparse(self.path).path
+            if path not in ("/v1/signals", "/v1/outcomes"):
                 return self._send(404, {"error": "not found"})
             if not self._authorised():
                 return self._send(401, {"error": "missing or wrong X-Ledger-Key"})
@@ -322,6 +441,18 @@ def make_handler(store, api_key: str):
             items = body if isinstance(body, list) else [body]
             if not items or len(items) > MAX_BATCH:
                 return self._send(400, {"error": f"send 1..{MAX_BATCH} records per request"})
+            if path == "/v1/outcomes":
+                try:
+                    orecs = [validate_outcome(it) for it in items]
+                except ValidationError as e:
+                    return self._send(400, {"error": str(e)})
+                try:
+                    statuses = store.insert_outcomes(orecs)
+                except Exception as e:
+                    return self._send(503, {"error": f"storage unavailable ({type(e).__name__})"})
+                unknown = [r["dedupe_key"] for r, s in zip(orecs, statuses) if s == "unknown_signal"]
+                return self._send(200, {"received": len(orecs), "inserted": statuses.count("inserted"),
+                                        "updated": statuses.count("updated"), "unknown_signals": unknown})
             try:
                 recs = [validate_signal(it) for it in items]
             except ValidationError as e:
