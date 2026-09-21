@@ -39,6 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import alerts as al
 import fundamentals as fd
+import ledger_hooks as lh
 import picks as pk
 import prices as px
 
@@ -95,8 +96,13 @@ def _holdings_and_alerts(last_close: dict[str, float], day: str) -> list[dict]:
     holdings = al.check_holdings(held, last_close, active, STOP_PCT)
     for h in holdings:
         if h["status"] == "STOP HIT":
-            _state.add_alert("STOP_HIT", h["symbol"],
-                             f"{h['symbol']} at {h['last']} is at/below stop {h['stop']} (bought {h['buy']})", day, "high")
+            is_new = _state.add_alert("STOP_HIT", h["symbol"],
+                                      f"{h['symbol']} at {h['last']} is at/below stop {h['stop']} (bought {h['buy']})", day, "high")
+            if is_new:
+                try:
+                    lh.record([lh.stop_hit_record(h, day, _now())])
+                except Exception as e:
+                    print(f"ledger hook failed (ignored): {e}")
     return holdings
 
 
@@ -164,6 +170,7 @@ def _run_locked(reason: str, started: datetime) -> None:
         new_active = {n: sorted(alloc[n]) for n in alloc}
         prev = st.get("active") or {}
         held = al.parse_holdings(os.environ.get("HOLDINGS", ""))
+        dropped: list = []
         if prev:
             added, dropped = al.diff_lists(prev, new_active)
             for s in added:
@@ -192,6 +199,12 @@ def _run_locked(reason: str, started: datetime) -> None:
     rows = _decorate(pk.build_rows(st["alloc"], last_close, STOP_PCT))
     holdings = _holdings_and_alerts(last_close, data_day)
     _state.save()
+    if refresh:                                # a fresh weekly list: record it (a failure here never affects the run)
+        try:
+            lh.record(lh.pick_records(rows, st["active"], data_day, started, STOP_PCT)
+                      + lh.dropped_records(dropped, al.parse_holdings(os.environ.get("HOLDINGS", "")), data_day, started))
+        except Exception as e:
+            print(f"ledger hook failed (ignored): {e}")
 
     with _lock:
         _latest.clear()
@@ -233,6 +246,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "strategies": ["steady", "gods_plan"],
                     "schedule": f"weekdays {RUN_TIME} IST; list re-screened weekday={REFRESH_WEEKDAY}",
                     "disclaimer": "Screen output, not investment advice. Backtests are survivorship-biased.",
+                    "ledger": lh.status(),
                     **_latest,
                 }, default=str).encode("utf-8")
             self.send_response(200)
