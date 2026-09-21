@@ -13,3 +13,12 @@ so accuracy can be measured later. Nothing here trades or changes any scanner.
   `kind` is `signal`, `rejected` or `event`.
 
 Tests: `python -m pytest test_server.py test_ledger_client.py` (60, no network or database needed).
+
+## Outcomes (added 2026-09-21)
+- `POST /v1/outcomes` records what happened to a signal (named by its `dedupe_key`; re-posting the same signal, horizon and method
+  replaces the label). `GET /v1/outcomes` returns labels joined to their signals; `GET /v1/unlabeled?method=&horizon=` lists signals
+  still waiting.
+- **Labeler**: `outcome_labeler.py` (in the options-scanner service) runs weekdays at 16:05 IST for the options-scanner and
+  diamond-directional signals. Method `premium_20_15_v1`, horizon `intraday_1515`: entry at the recorded premium, exit by 15:15,
+  win = +20% before -15%, from Dhan's 1-minute candles of the option contract. Status is under `labeler` in that service's `/status`.
+- Not covered yet: SENSEX options (BSE), signals whose contract has already expired (`no_contract`), stock picks (a 90-day design).
