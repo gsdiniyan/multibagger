@@ -182,20 +182,26 @@ def _run_locked(reason: str, started: datetime) -> None:
             # a screen of the whole universe with nothing in any strategy is a data failure, not a verdict
             raise RuntimeError("the re-screen returned no picks for any strategy; kept the current list")
         held = al.parse_holdings(os.environ.get("HOLDINGS", ""))
+        added: list = []
         dropped: list = []
         if had_list:
             added, dropped = al.diff_lists(prev, new_active)
-            for s in added:
-                _state.add_alert("NEW_PICK", s, f"{s} entered the list", data_day)
-            for s in dropped:
-                mine = s in held
-                _state.add_alert("DROPPED_PICK", s, f"{s} left the list" + (" (you hold it)" if mine else ""),
-                                 data_day, "high" if mine else "info")
         elif prev:
-            # recovering from a saved empty list (2026-09-28's failed screen): the "left the list" alerts it raised
-            # were false, and every pick "entering" again would be just as false
+            # recovering from a saved empty list (2026-09-28's failed screen). Its "left the list" alerts were false,
+            # but together they name exactly the list it wiped, so the new list is compared with that one: only real
+            # changes are announced, not every pick "entering" again
             bad_day = st.get("list_date")
-            st["alerts"] = [a for a in st["alerts"] if not (a["kind"] == "DROPPED_PICK" and a.get("day") == bad_day)]
+            is_false = lambda a: a["kind"] == "DROPPED_PICK" and a.get("day") == bad_day
+            wiped = sorted({a["symbol"] for a in st["alerts"] if is_false(a)})
+            st["alerts"] = [a for a in st["alerts"] if not is_false(a)]
+            if wiped:
+                added, dropped = al.diff_lists({"before": wiped}, new_active)
+        for s in added:
+            _state.add_alert("NEW_PICK", s, f"{s} entered the list", data_day)
+        for s in dropped:
+            mine = s in held
+            _state.add_alert("DROPPED_PICK", s, f"{s} left the list" + (" (you hold it)" if mine else ""),
+                             data_day, "high" if mine else "info")
         union = sorted({s for v in new_active.values() for s in v})
         try:
             fresh = fd.check(union)

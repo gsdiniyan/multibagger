@@ -255,7 +255,11 @@ def test_a_saved_empty_list_is_rescreened_at_once_and_its_false_alerts_are_clear
     svc._state.add_alert("DROPPED_PICK", "OLD", "OLD left the list", "2026-09-14")   # a real one from another week
     monkeypatch.setattr(svc.px, "fetch_all", lambda syms: _synthetic_store(1))
     svc._run_locked("test", datetime(2026, 10, 1, 16, 10, tzinfo=IST))           # a Thursday, not the weekly day
-    assert any(st["active"].values()) and svc._latest["picks"]
-    left = [a["symbol"] for a in st["alerts"] if a["kind"] == "DROPPED_PICK"]
-    assert left == ["OLD"]
-    assert not [a for a in st["alerts"] if a["kind"] == "NEW_PICK"]                 # not 30 "entered the list" alerts
+    now = {s for v in st["active"].values() for s in v}
+    assert now and svc._latest["picks"]
+    assert not [a for a in st["alerts"] if a["day"] == "2026-09-25"]               # the false alerts are gone
+    assert [a["symbol"] for a in st["alerts"] if a["kind"] == "DROPPED_PICK" and a["day"] == "2026-09-14"] == ["OLD"]
+    # compared with the list the failed screen wiped (VEDL, SBIN), not with nothing
+    assert {a["symbol"] for a in st["alerts"] if a["kind"] == "NEW_PICK"} == now - {"VEDL", "SBIN"}
+    assert {a["symbol"] for a in st["alerts"] if a["kind"] == "DROPPED_PICK" and a["day"] == "2026-09-18"} == \
+        {"VEDL", "SBIN"} - now
