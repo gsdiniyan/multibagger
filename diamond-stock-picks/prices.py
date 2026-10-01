@@ -97,7 +97,20 @@ def _fix_splits(close: pd.DataFrame, warnings: list[str]) -> set[str]:
     return unverified
 
 
-def fetch_all(symbols: list[str], workers: int = 2) -> PriceStore:
+def _nifty_history(sleep=time.sleep) -> pd.DataFrame:
+    """NIFTY's daily history, the screen's benchmark. Raises when Dhan has none after three tries: without it the
+    screener returns an empty list, and on 2026-09-28 (a 06:00 IST restart, before Dhan's history endpoint was up)
+    that empty list was saved as the week's picks and all 27 picks were reported as having left the list."""
+    for attempt in range(3):
+        nifty = dc.get_index_history("NIFTY", years=HISTORY_YEARS)
+        if nifty is not None and len(nifty):
+            return nifty
+        if attempt < 2:
+            sleep(5 * (attempt + 1))
+    raise RuntimeError("Dhan returned no NIFTY history (the screen's benchmark); kept the current list")
+
+
+def fetch_all(symbols: list[str], workers: int = 2, sleep=time.sleep) -> PriceStore:
     """Fetch daily history for bare NSE symbols (no .NS) + the Nifty index from Dhan."""
     # Load the instrument list once, single-threaded: on a fresh machine two workers would both
     # download and write the 35 MB scrip-master file at the same time and one reads it half-written.
@@ -110,9 +123,7 @@ def fetch_all(symbols: list[str], workers: int = 2) -> PriceStore:
         raise RuntimeError("Dhan returned no price history (token expired or Dhan unreachable)")
     close = pd.DataFrame({t: df["Close"] for t, df in ok.items()}).sort_index()
     volume = pd.DataFrame({t: df["Volume"] for t, df in ok.items()}).sort_index()
-    nifty = dc.get_index_history("NIFTY", years=HISTORY_YEARS)
-    if nifty is not None and len(nifty):
-        close["^NSEI"] = _ist_fix(nifty)["Close"]
+    close["^NSEI"] = _ist_fix(_nifty_history(sleep))["Close"]
     warnings: list[str] = []
     excluded = sorted(_fix_splits(close, warnings))
     close = close.drop(columns=excluded, errors="ignore")

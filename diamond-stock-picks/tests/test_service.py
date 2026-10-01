@@ -207,3 +207,53 @@ def test_data_error_clears_after_a_good_run(svc, monkeypatch, tmp_path):
     monkeypatch.setattr(svc.px, "fetch_all", lambda syms: _synthetic_store(1))
     svc._run_locked("test", datetime(2026, 9, 21, 16, 10, tzinfo=IST))
     assert not [a for a in svc._latest["alerts"] if a["kind"] == "DATA_ERROR"]
+
+
+# ---------- 2026-09-28: a missing NIFTY benchmark saved an empty list and "dropped" all 27 picks ----------
+
+def test_fetch_all_retries_then_refuses_to_go_on_without_the_nifty_benchmark(monkeypatch):
+    idx = pd.DatetimeIndex(["2026-09-17 18:30:00", "2026-09-18 18:30:00"])
+    frame = pd.DataFrame({"Close": [100.0, 101.0], "Volume": [1, 1]}, index=idx)
+    monkeypatch.setattr(px.dc, "_equity_ids", lambda: {})
+    monkeypatch.setattr(px.dc, "get_equity_history", lambda sym, years=3.3: frame)
+    calls, sleeps = [], []
+    monkeypatch.setattr(px.dc, "get_index_history", lambda *a, **k: calls.append(1) or None)
+    with pytest.raises(RuntimeError, match="NIFTY"):
+        px.fetch_all(["AAA"], workers=1, sleep=sleeps.append)
+    assert len(calls) == 3 and sleeps == [5, 10]
+    tries = iter([None, frame])                                     # comes back on the second try
+    monkeypatch.setattr(px.dc, "get_index_history", lambda *a, **k: next(tries))
+    store = px.fetch_all(["AAA"], workers=1, sleep=lambda s: None)
+    assert "^NSEI" in store.close.columns
+
+
+def test_an_empty_rescreen_keeps_the_current_list(svc, monkeypatch, tmp_path):
+    monkeypatch.setattr(svc, "_state", al.State(str(tmp_path)))
+    monkeypatch.setenv("HOLDINGS", "")
+    monkeypatch.setattr(svc.px, "fetch_all", lambda syms: _synthetic_store(1))
+    svc._run_locked("test", datetime(2026, 9, 21, 16, 10, tzinfo=IST))
+    before = dict(svc._state.data["active"])
+    assert any(before.values())
+    monkeypatch.setattr(svc.pk, "compute", lambda last_date, capital: {n: {} for n in before})
+    svc._state.data["list_date"] = "2026-09-11"                     # last screened a week before the data
+    monkeypatch.setattr(svc, "_now", lambda: datetime(2026, 9, 28, 16, 10, tzinfo=IST))
+    svc._run("test")                                                # the next Monday's re-screen finds nothing
+    assert svc._latest["run_state"] == "error" and svc._state.data["active"] == before
+    kinds = [a["kind"] for a in svc._state.data["alerts"]]
+    assert "DATA_ERROR" in kinds and "DROPPED_PICK" not in kinds
+
+
+def test_a_saved_empty_list_is_rescreened_at_once_and_its_false_alerts_are_cleared(svc, monkeypatch, tmp_path):
+    monkeypatch.setattr(svc, "_state", al.State(str(tmp_path)))
+    monkeypatch.setenv("HOLDINGS", "")
+    st = svc._state.data
+    st.update(active={"steady": [], "gods_plan": []}, alloc={"steady": {}, "gods_plan": {}}, list_date="2026-09-25")
+    for s in ("VEDL", "SBIN"):
+        svc._state.add_alert("DROPPED_PICK", s, f"{s} left the list", "2026-09-25")
+    svc._state.add_alert("DROPPED_PICK", "OLD", "OLD left the list", "2026-09-14")   # a real one from another week
+    monkeypatch.setattr(svc.px, "fetch_all", lambda syms: _synthetic_store(1))
+    svc._run_locked("test", datetime(2026, 10, 1, 16, 10, tzinfo=IST))           # a Thursday, not the weekly day
+    assert any(st["active"].values()) and svc._latest["picks"]
+    left = [a["symbol"] for a in st["alerts"] if a["kind"] == "DROPPED_PICK"]
+    assert left == ["OLD"]
+    assert not [a for a in st["alerts"] if a["kind"] == "NEW_PICK"]                 # not 30 "entered the list" alerts

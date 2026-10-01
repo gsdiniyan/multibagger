@@ -18,11 +18,16 @@ ALERTS (shown on the dashboard from /status, kept in STATE_DIR/state.json)
   NEW_PICK       stock entered the list at a weekly re-screen
   DROPPED_PICK   stock left the list (high severity if you hold it)
   FUNDAMENTALS   a listed stock is rated AVOID by the fundamentals check
-  DATA_ERROR     Dhan returned no data (usually an expired DHAN_ACCESS_TOKEN); cleared by the next good run
+  DATA_ERROR     Dhan returned no data (usually an expired DHAN_ACCESS_TOKEN), no NIFTY benchmark, or a re-screen
+                 with no picks at all; the current list is kept, the run is retried every RETRY_MINUTES, and the
+                 alert clears with the next good run
+
+A re-screen never replaces the list with an empty one, and an empty list (from before that guard) is re-screened
+on the next run rather than kept until the weekly day.
 
 CONFIG (env): DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, CAPITAL (default 500000), STOP_PCT (10),
-HOLDINGS ("DIVISLAB:3@8570,SBIN:27@990"), STOP_CHECK_MINUTES (15), STATE_DIR (attach a Railway volume there to keep
-alerts across redeploys), RUN_TIME (HH:MM IST), PICKS_REFRESH_WEEKDAY, PORT.
+HOLDINGS ("DIVISLAB:3@8570,SBIN:27@990"), STOP_CHECK_MINUTES (15), RETRY_MINUTES (30), STATE_DIR (attach a Railway
+volume there to keep alerts across redeploys), RUN_TIME (HH:MM IST), PICKS_REFRESH_WEEKDAY, PORT.
 
 Not investment advice: this is the output of a momentum / low-beta screen. Backtests of the
 engine are inflated by survivorship bias (today's index members applied to past years).
@@ -50,6 +55,7 @@ RUN_TIME = os.environ.get("RUN_TIME", "16:10")
 REFRESH_WEEKDAY = int(os.environ.get("PICKS_REFRESH_WEEKDAY", "0"))
 STATE_DIR = os.environ.get("STATE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state"))
 STOP_CHECK_MINUTES = int(os.environ.get("STOP_CHECK_MINUTES", "15"))
+RETRY_MINUTES = int(os.environ.get("RETRY_MINUTES", "30"))
 DEFAULT_PORT = 8080
 
 _lock = threading.Lock()
@@ -164,14 +170,20 @@ def _run_locked(reason: str, started: datetime) -> None:
     # a data error is a transient state: it clears itself once a run succeeds
     st["alerts"] = [a for a in st["alerts"] if a["kind"] != "DATA_ERROR"]
 
-    refresh = (not st.get("alloc")) or (started.weekday() == REFRESH_WEEKDAY and st.get("list_date") != data_day)
+    prev = st.get("active") or {}
+    had_list = any(prev.values())
+    # an empty list is never kept: re-screen on the next run rather than wait for the weekly day
+    refresh = (not st.get("alloc")) or not had_list or (
+        started.weekday() == REFRESH_WEEKDAY and st.get("list_date") != data_day)
     if refresh:
         alloc = pk.compute(store.last_date, CAPITAL)
         new_active = {n: sorted(alloc[n]) for n in alloc}
-        prev = st.get("active") or {}
+        if not any(new_active.values()):
+            # a screen of the whole universe with nothing in any strategy is a data failure, not a verdict
+            raise RuntimeError("the re-screen returned no picks for any strategy; kept the current list")
         held = al.parse_holdings(os.environ.get("HOLDINGS", ""))
         dropped: list = []
-        if prev:
+        if had_list:
             added, dropped = al.diff_lists(prev, new_active)
             for s in added:
                 _state.add_alert("NEW_PICK", s, f"{s} entered the list", data_day)
@@ -179,6 +191,11 @@ def _run_locked(reason: str, started: datetime) -> None:
                 mine = s in held
                 _state.add_alert("DROPPED_PICK", s, f"{s} left the list" + (" (you hold it)" if mine else ""),
                                  data_day, "high" if mine else "info")
+        elif prev:
+            # recovering from a saved empty list (2026-09-28's failed screen): the "left the list" alerts it raised
+            # were false, and every pick "entering" again would be just as false
+            bad_day = st.get("list_date")
+            st["alerts"] = [a for a in st["alerts"] if not (a["kind"] == "DROPPED_PICK" and a.get("day") == bad_day)]
         union = sorted({s for v in new_active.values() for s in v})
         try:
             fresh = fd.check(union)
@@ -223,13 +240,19 @@ def _run_locked(reason: str, started: datetime) -> None:
 def _loop() -> None:
     _run("startup")
     last_run_day = _now().date() if _now().strftime("%H:%M") >= RUN_TIME else None
-    last_quick = time.time()
+    last_quick = last_retry = time.time()
     while True:
         time.sleep(30)
         now = _now()
+        with _lock:
+            failed = _latest.get("run_state") == "error"
         if now.weekday() < 5 and now.strftime("%H:%M") >= RUN_TIME and last_run_day != now.date():
             last_run_day = now.date()
             _run("scheduled")
+        elif failed and time.time() - last_retry >= RETRY_MINUTES * 60:
+            # a failed run (Dhan down, no benchmark) used to wait for the next day's RUN_TIME
+            last_retry = time.time()
+            _run("retry")
         elif _market_open(now) and time.time() - last_quick >= STOP_CHECK_MINUTES * 60:
             last_quick = time.time()
             _quick_check()
