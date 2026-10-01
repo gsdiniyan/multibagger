@@ -115,6 +115,9 @@ def fetch_all(symbols: list[str], workers: int = 2, sleep=time.sleep) -> PriceSt
     # Load the instrument list once, single-threaded: on a fresh machine two workers would both
     # download and write the 35 MB scrip-master file at the same time and one reads it half-written.
     dc._equity_ids()
+    # the benchmark first: without it the run cannot finish, and on 2026-10-01 a pre-market run spent 19 minutes
+    # on the ~170 stock histories before finding NIFTY missing
+    nifty = _nifty_history(sleep)
     with ThreadPoolExecutor(workers) as ex:
         results = list(ex.map(_fetch_one, symbols))
     ok = {f"{s}.NS": df for s, df in results if df is not None}
@@ -123,7 +126,7 @@ def fetch_all(symbols: list[str], workers: int = 2, sleep=time.sleep) -> PriceSt
         raise RuntimeError("Dhan returned no price history (token expired or Dhan unreachable)")
     close = pd.DataFrame({t: df["Close"] for t, df in ok.items()}).sort_index()
     volume = pd.DataFrame({t: df["Volume"] for t, df in ok.items()}).sort_index()
-    close["^NSEI"] = _ist_fix(_nifty_history(sleep))["Close"]
+    close["^NSEI"] = _ist_fix(nifty)["Close"]
     warnings: list[str] = []
     excluded = sorted(_fix_splits(close, warnings))
     close = close.drop(columns=excluded, errors="ignore")

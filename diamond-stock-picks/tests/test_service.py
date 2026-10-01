@@ -215,12 +215,14 @@ def test_fetch_all_retries_then_refuses_to_go_on_without_the_nifty_benchmark(mon
     idx = pd.DatetimeIndex(["2026-09-17 18:30:00", "2026-09-18 18:30:00"])
     frame = pd.DataFrame({"Close": [100.0, 101.0], "Volume": [1, 1]}, index=idx)
     monkeypatch.setattr(px.dc, "_equity_ids", lambda: {})
-    monkeypatch.setattr(px.dc, "get_equity_history", lambda sym, years=3.3: frame)
+    stock_calls = []
+    monkeypatch.setattr(px.dc, "get_equity_history", lambda sym, years=3.3: stock_calls.append(sym) or frame)
     calls, sleeps = [], []
     monkeypatch.setattr(px.dc, "get_index_history", lambda *a, **k: calls.append(1) or None)
     with pytest.raises(RuntimeError, match="NIFTY"):
         px.fetch_all(["AAA"], workers=1, sleep=sleeps.append)
     assert len(calls) == 3 and sleeps == [5, 10]
+    assert stock_calls == []                                        # fails fast, before ~170 stock fetches
     tries = iter([None, frame])                                     # comes back on the second try
     monkeypatch.setattr(px.dc, "get_index_history", lambda *a, **k: next(tries))
     store = px.fetch_all(["AAA"], workers=1, sleep=lambda s: None)
