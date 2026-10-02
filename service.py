@@ -53,6 +53,13 @@ from pathlib import Path
 
 import pandas as pd
 
+import tracking
+
+try:                                          # the ledger is optional: a missing/broken client must never stop the service
+    from ledger_client import LedgerClient
+except Exception:                             # pragma: no cover
+    LedgerClient = None
+
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", str(BASE_DIR / "output")))
 RUN_STATE_PATH = OUTPUT_DIR / "run_state.json"
@@ -125,6 +132,59 @@ def _run_scan() -> None:
     except Exception as e:
         print(f"Failed to write run_state.json: {e}")
     print(f"[{finished.isoformat()}] Scan finished, process_ok={ok}")
+    if ok:
+        _track_and_record(finished)
+
+
+LEDGER_SOURCE = "multibagger-screener"
+RULE_VERSION = "multibagger-screener-v1"
+_ledger = None
+
+
+def _get_ledger():
+    global _ledger
+    if _ledger is None and LedgerClient is not None:
+        try:
+            _ledger = LedgerClient(service=LEDGER_SOURCE, spool_dir=str(OUTPUT_DIR))
+        except Exception as e:
+            print(f"ledger client unavailable: {e}")
+    return _ledger
+
+
+def _ledger_records(picks: list, result: dict, when: datetime) -> list:
+    """A stock entering the top list -> a BUY signal (once per stay on the list); leaving it -> a DROPPED event."""
+    by_sym = {p.get("symbol"): p for p in picks if p.get("symbol")}
+    day, out = result.get("day") or when.date().isoformat(), []
+    for sym in result.get("added") or []:
+        p, t = by_sym.get(sym) or {}, (result.get("picks") or {}).get(sym) or {}
+        out.append({"source": LEDGER_SOURCE, "strategy": "multibagger_screener", "symbol": sym, "action": "BUY",
+                    "kind": "signal", "direction": "BULLISH", "rule_version": RULE_VERSION,
+                    "dedupe_key": f"{LEDGER_SOURCE}:{day}:{sym}:entered", "ts_signal": when.isoformat(),
+                    "entry_price": t.get("last_close") or p.get("current_price"), "stop": t.get("stop"),
+                    "target1": t.get("two_r"), "score": p.get("multibagger_score"), "features": {**p, **t}})
+    for sym in result.get("dropped") or []:
+        out.append({"source": LEDGER_SOURCE, "strategy": "multibagger_screener", "symbol": sym, "action": "DROPPED",
+                    "kind": "event", "rule_version": RULE_VERSION, "dedupe_key": f"{LEDGER_SOURCE}:{day}:{sym}:dropped",
+                    "ts_signal": when.isoformat(), "features": {"data_as_of": day}})
+    return out
+
+
+def _track_and_record(when: datetime) -> None:
+    """After a good scan: stops / 2R / status for the top picks (tracking.py), and the list's entries and exits to
+    the trading ledger. Never raises."""
+    try:
+        sys.path.insert(0, str(BASE_DIR / "src"))
+        from src.dhan_client import get_daily_history
+        picks = _load_top_picks(OUTPUT_DIR / "final.csv") or _load_top_picks(OUTPUT_DIR / "scored.csv")
+        result = tracking.track([p.get("symbol") for p in picks], when.date(), OUTPUT_DIR, get_daily_history)
+        print(f"[{_ist_now().isoformat()}] tracked {len(result['picks'])} picks "
+              f"(+{len(result['added'])} new, -{len(result['dropped'])} left)")
+        client = _get_ledger()
+        if client is not None:
+            client.record_many(_ledger_records(picks, result, when))
+            client.flush(20)
+    except Exception as e:
+        print(f"tracking failed (ignored): {type(e).__name__}: {e}")
 
 
 def _seconds_until_next_run() -> float:
@@ -244,6 +304,12 @@ def _build_status() -> dict:
 
     previous_picks = _load_top_picks(PREVIOUS_PICKS_PATH)
 
+    tracked = tracking.load(OUTPUT_DIR)
+    for p in top_picks:                        # stops, 2R and status since joining the list (tracking.py)
+        t = (tracked.get("picks") or {}).get(p.get("symbol")) or {}
+        p.update({k: t.get(k) for k in ("stop", "two_r", "risk_pct", "atr_pct", "status", "status_at", "list_price",
+                                          "list_date", "trail_stop", "since_list_pct", "last_close")})
+
     return {
         "project": "Multibagger",
         "last_run": {
@@ -256,6 +322,9 @@ def _build_status() -> dict:
         },
         "top_picks": top_picks,
         "changes": _diff_picks(top_picks, previous_picks),
+        "tracking_as_of": tracked.get("day"),
+        "stop_rule": (f"{tracking.stops.ATR_MULT}x ATR below the price ({tracking.stops.MIN_DIST:.0%}-"
+                      f"{tracking.stops.MAX_DIST:.0%}); status trails the highest close since a pick joined the list"),
     }
 
 
