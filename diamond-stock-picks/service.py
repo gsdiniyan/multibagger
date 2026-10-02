@@ -47,6 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import alerts as al
 import fundamentals as fd
+import keepalive
 import ledger_hooks as lh
 import picks as pk
 import prices as px
@@ -312,6 +313,7 @@ class _Server(ThreadingHTTPServer):
 
 def main() -> None:
     port = int(os.environ.get("PORT", DEFAULT_PORT))
+    keepalive.start()                                   # stays awake 08:50-16:45 IST weekdays when Railway sleep mode is on
     threading.Thread(target=_loop, daemon=True).start()
     print(f"diamond-stock-picks listening on :{port}", flush=True)
     _Server(("0.0.0.0", port), _Handler).serve_forever()
