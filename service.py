@@ -214,7 +214,7 @@ def _load_run_state() -> dict:
 _PICK_COLS = (
     "symbol", "name", "sector", "current_price", "multibagger_score",
     "technical_score", "supertrend_daily_signal", "supertrend_weekly_signal",
-    "roe", "roce", "promoter_holding", "rationale",
+    "roe", "roce", "promoter_holding", "rationale", "pe_ratio",
 )
 
 
