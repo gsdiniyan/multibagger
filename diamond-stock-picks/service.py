@@ -95,6 +95,15 @@ def _decorate(rows: list[dict]) -> list[dict]:
         r.update(verdict=f.get("verdict", "n/a"), flags=f.get("flags", []), pe=f.get("pe"), pb=f.get("pb"),
                  de=None if f.get("financial") else f.get("de"), roe=f.get("roe"), sales_g=f.get("sales_g"),
                  earn_g=f.get("earn_g"), financial=bool(f.get("financial")))
+    status = _state.data.get("pick_status") or {}
+    for r in rows:                     # since the stock joined the list (picks.pick_status), plus today's live price
+        ps = status.get(r["symbol"]) or {}
+        r.update(status=ps.get("status"), status_at=ps.get("at"), list_price=ps.get("ref_price"),
+                 list_date=ps.get("ref_date"), trail_stop=ps.get("stop"),
+                 since_list_pct=(round((r["price"] / ps["ref_price"] - 1) * 100, 2)
+                                 if ps.get("ref_price") and r.get("price") == r.get("price") else None))
+        if ps.get("status") in ("OPEN", "2R REACHED") and ps.get("stop") and r.get("price") and r["price"] <= ps["stop"]:
+            r["status"] = "BELOW STOP (live)"
     order = {"OK": 0, "WATCH": 1, "AVOID": 2}
     rows.sort(key=lambda r: (order.get(r["verdict"], 3), -r["invest"]))
     return rows
@@ -226,6 +235,15 @@ def _run_locked(reason: str, started: datetime) -> None:
                 flags = "; ".join(st["fundamentals"][s].get("flags", []))
                 _state.add_alert("FUNDAMENTALS", s, f"{s} rated AVOID by fundamentals check: {flags}", data_day, "warn")
         st.update(active=new_active, alloc=alloc, list_date=data_day)
+
+    # each listed stock's own start date: kept while it stays on the list, so a weekly re-screen does not reset it
+    since = st.setdefault("pick_since", {})
+    on_list = {s for v in st["active"].values() for s in v}
+    for s in on_list:
+        since.setdefault(s, st.get("list_date") or data_day)
+    for s in [s for s in since if s not in on_list]:
+        del since[s]
+    st["pick_status"] = pk.pick_status(store.close, since, st["atr_pct"], STOP_PCT)
 
     if _market_open(started):
         live = px.live_prices(sorted({s for a in st["alloc"].values() for s in a} | set(al.parse_holdings(os.environ.get("HOLDINGS", "")))))
