@@ -6,6 +6,8 @@ import sys
 
 import pandas as pd
 
+import stops
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine"))
 
 STRATEGIES = ("steady", "gods_plan")
@@ -37,8 +39,10 @@ def compute(last_date: pd.Timestamp, capital: float) -> dict[str, dict[str, floa
     return out
 
 
-def build_rows(alloc: dict[str, dict[str, float]], last_close: dict[str, float], stop_pct: float) -> list[dict]:
-    """One row per distinct stock: list membership, reference price, quantity, stop."""
+def build_rows(alloc: dict[str, dict[str, float]], last_close: dict[str, float], stop_pct: float,
+               atr: dict[str, float] | None = None) -> list[dict]:
+    """One row per distinct stock: list membership, reference price, quantity, starting stop (2.5x ATR, 5-15%,
+    stop_pct when there is no ATR) and the 2R milestone. No fixed target: see stops.py."""
     symbols = sorted({s for a in alloc.values() for s in a})
     rows = []
     for s in symbols:
@@ -53,6 +57,6 @@ def build_rows(alloc: dict[str, dict[str, float]], last_close: dict[str, float],
             "price": shown,
             "qty": qty,
             "invest": round(qty * price),
-            "stop": round(shown * (1 - stop_pct / 100), 2),
+            **stops.entry_levels(shown, (atr or {}).get(s), stop_pct),
         })
     return rows

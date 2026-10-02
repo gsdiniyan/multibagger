@@ -6,6 +6,8 @@ import os
 import tempfile
 from datetime import datetime
 
+import stops
+
 MAX_ALERTS = 200
 
 
@@ -62,18 +64,27 @@ def diff_lists(prev: dict[str, list[str]], new: dict[str, list[str]]) -> tuple[l
     return sorted(cur - old), sorted(old - cur)
 
 
-def check_holdings(holdings: dict, last_close: dict[str, float], active: set[str], stop_pct: float) -> list[dict]:
+def check_holdings(holdings: dict, last_close: dict[str, float], active: set[str], stop_pct: float,
+                   trails: dict | None = None, closes: dict[str, float] | None = None,
+                   atr: dict[str, float] | None = None) -> list[dict]:
+    """One row per holding with its trailing stop (see stops.py). `trails` is the persisted {symbol: trail state},
+    updated in place; `closes` are daily closes that may raise the high (None on an intraday check)."""
+    trails = {} if trails is None else trails
+    for sym in [s for s in trails if s not in holdings]:
+        del trails[sym]
     rows = []
     for sym, h in holdings.items():
         px = last_close.get(sym)
         if px is None or px != px:
             rows.append({"symbol": sym, "status": "NO PRICE", **h})
             continue
-        stop = h["buy"] * (1 - stop_pct / 100)
+        t = trails[sym] = stops.trail(trails.get(sym), h["buy"], (closes or {}).get(sym), (atr or {}).get(sym), stop_pct)
+        stop = t["stop"]
         status = "STOP HIT" if px <= stop else ("HELD" if sym in active else "NOT ON LIST")
         rows.append({
             "symbol": sym, "qty": h["qty"], "buy": h["buy"], "last": round(px, 2),
             "pnl_pct": round((px / h["buy"] - 1) * 100, 2), "pnl_rs": round((px - h["buy"]) * h["qty"]),
-            "stop": round(stop, 2), "status": status,
+            "stop": stop, "stop_pct": round((stop / px - 1) * 100, 1), "high": t["high"], "two_r": t["two_r"],
+            "two_r_hit": t["two_r_hit"], "trailing": stop > round(h["buy"] * (1 - t["dist"]), 2), "status": status,
         })
     return rows

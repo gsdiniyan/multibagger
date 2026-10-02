@@ -14,7 +14,9 @@ every STOP_CHECK_MINUTES (default 15) a light check re-prices the list and your 
 raises STOP_HIT alerts intraday. It polls, so a stop can be crossed and recovered between two checks.
 
 ALERTS (shown on the dashboard from /status, kept in STATE_DIR/state.json)
-  STOP_HIT       a holding closed at or below buy * (1 - STOP_PCT/100)
+  STOP_HIT       a holding is at or below its trailing stop (stops.py: 2.5x ATR, 5-15%, below the highest close
+                 since it was first seen, never lowered; STOP_PCT when a stock has no ATR)
+  TWO_R          a holding closed at its 2R level (buy + 2x the starting risk): its stop is now at least the buy price
   NEW_PICK       stock entered the list at a weekly re-screen
   DROPPED_PICK   stock left the list (high severity if you hold it)
   FUNDAMENTALS   a listed stock is rated AVOID by the fundamentals check
@@ -25,9 +27,10 @@ ALERTS (shown on the dashboard from /status, kept in STATE_DIR/state.json)
 A re-screen never replaces the list with an empty one, and an empty list (from before that guard) is re-screened
 on the next run rather than kept until the weekly day.
 
-CONFIG (env): DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, CAPITAL (default 500000), STOP_PCT (10),
-HOLDINGS ("DIVISLAB:3@8570,SBIN:27@990"), STOP_CHECK_MINUTES (15), RETRY_MINUTES (30), STATE_DIR (attach a Railway
-volume there to keep alerts across redeploys), RUN_TIME (HH:MM IST), PICKS_REFRESH_WEEKDAY, PORT.
+CONFIG (env): DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, CAPITAL (default 500000), STOP_ATR_MULT (2.5), STOP_PCT (10, the
+stop when a stock has no ATR), HOLDINGS ("DIVISLAB:3@8570,SBIN:27@990"), STOP_CHECK_MINUTES (15), RETRY_MINUTES (30),
+STATE_DIR (attach a Railway volume there to keep alerts and trailing highs across redeploys), RUN_TIME (HH:MM IST),
+PICKS_REFRESH_WEEKDAY, PORT.
 
 Not investment advice: this is the output of a momentum / low-beta screen. Backtests of the
 engine are inflated by survivorship bias (today's index members applied to past years).
@@ -47,6 +50,7 @@ import fundamentals as fd
 import ledger_hooks as lh
 import picks as pk
 import prices as px
+import stops
 
 IST = timezone(timedelta(hours=5, minutes=30))
 CAPITAL = float(os.environ.get("CAPITAL", "500000"))
@@ -95,15 +99,21 @@ def _decorate(rows: list[dict]) -> list[dict]:
     return rows
 
 
-def _holdings_and_alerts(last_close: dict[str, float], day: str) -> list[dict]:
+def _holdings_and_alerts(last_close: dict[str, float], day: str, closes: dict[str, float] | None = None) -> list[dict]:
+    """`closes` are daily closes (the scheduled run): only they raise a holding's high and so its trailing stop."""
     st = _state.data
     held = al.parse_holdings(os.environ.get("HOLDINGS", ""))
     active = {s for v in st["active"].values() for s in v}
-    holdings = al.check_holdings(held, last_close, active, STOP_PCT)
+    trails = st.setdefault("trails", {})
+    was_2r = {s for s, t in trails.items() if t.get("two_r_hit")}
+    holdings = al.check_holdings(held, last_close, active, STOP_PCT, trails, closes, st.get("atr_pct"))
     for h in holdings:
+        if h.get("two_r_hit") and h["symbol"] not in was_2r:
+            _state.add_alert("TWO_R", h["symbol"], f"{h['symbol']} closed at its 2R level {h['two_r']} (bought {h['buy']}); "
+                             f"stop raised to at least break-even, now {h['stop']}", day)
         if h["status"] == "STOP HIT":
             is_new = _state.add_alert("STOP_HIT", h["symbol"],
-                                      f"{h['symbol']} at {h['last']} is at/below stop {h['stop']} (bought {h['buy']})", day, "high")
+                                      f"{h['symbol']} at {h['last']} is at/below {'trailing ' if h.get('trailing') else ''}stop {h['stop']} (bought {h['buy']})", day, "high")
             if is_new:
                 try:
                     lh.record([lh.stop_hit_record(h, day, _now())])
@@ -128,7 +138,7 @@ def _quick_check() -> None:
         if not live:
             return
         day = _now().date().isoformat()
-        rows = _decorate(pk.build_rows(st["alloc"], live, STOP_PCT))
+        rows = _decorate(pk.build_rows(st["alloc"], live, STOP_PCT, st.get("atr_pct")))
         holdings = _holdings_and_alerts(live, day)
         _state.save()
         with _lock:
@@ -164,8 +174,10 @@ def _run_locked(reason: str, started: datetime) -> None:
     store = px.fetch_all(symbols)
     px.install(store)
     last_close = _last_close(store)
+    daily_close = dict(last_close)
     data_day = store.last_date.date().isoformat()
     st = _state.data
+    st["atr_pct"] = {**st.get("atr_pct", {}), **store.atr_pct}
     price_source = "dhan daily close"
     # a data error is a transient state: it clears itself once a run succeeds
     st["alerts"] = [a for a in st["alerts"] if a["kind"] != "DATA_ERROR"]
@@ -219,8 +231,8 @@ def _run_locked(reason: str, started: datetime) -> None:
         if live:
             last_close = {**last_close, **live}
             price_source = "dhan live quote"
-    rows = _decorate(pk.build_rows(st["alloc"], last_close, STOP_PCT))
-    holdings = _holdings_and_alerts(last_close, data_day)
+    rows = _decorate(pk.build_rows(st["alloc"], last_close, STOP_PCT, st["atr_pct"]))
+    holdings = _holdings_and_alerts(last_close, data_day, daily_close)
     _state.save()
     if refresh:                                # a fresh weekly list: record it (a failure here never affects the run)
         try:
@@ -234,6 +246,8 @@ def _run_locked(reason: str, started: datetime) -> None:
         _latest.update(
             run_state="ready", reason=reason, computed_at=started.isoformat(), data_as_of=data_day,
             list_screened_on=st.get("list_date"), capital=CAPITAL, stop_pct=STOP_PCT,
+            stop_rule=f"trailing: {stops.ATR_MULT}x ATR below the highest close, {stops.MIN_DIST:.0%}-{stops.MAX_DIST:.0%}, "
+                      "never lowered; break-even once a close reaches the 2R level; no fixed target",
             price_source=price_source, universe_size=len(symbols), universe_with_prices=len(symbols) - len(store.missing),
             missing=store.missing, excluded=store.excluded,
             data_warnings=store.warnings[:20], counts={n: len(v) for n, v in st["active"].items()},

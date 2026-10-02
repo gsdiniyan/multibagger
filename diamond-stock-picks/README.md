@@ -25,7 +25,7 @@ your holdings, alerts, and data warnings.
 
 ## Alerts
 
-`STOP_HIT` (holding at/below buy x (1 - STOP_PCT/100)), `NEW_PICK`, `DROPPED_PICK` (high severity if
+`STOP_HIT` (holding at/below its trailing stop, see below), `TWO_R` (a holding closed at its 2R level), `NEW_PICK`, `DROPPED_PICK` (high severity if
 you hold it), `FUNDAMENTALS` (a listed stock rated AVOID), `DATA_ERROR` (usually an expired Dhan token).
 
 ## Configuration (Railway variables)
@@ -35,7 +35,8 @@ you hold it), `FUNDAMENTALS` (a listed stock rated AVOID), `DATA_ERROR` (usually
 | `DHAN_CLIENT_ID`, `DHAN_ACCESS_TOKEN` | required | Dhan credentials (token expires about daily) |
 | `HOLDINGS` | empty | what you own: `DIVISLAB:3@8570,SBIN:27@990` (symbol:qty@buy price) |
 | `CAPITAL` | 500000 | rupees the engine splits across the picks (sets quantities) |
-| `STOP_PCT` | 10 | stop distance below buy price / reference price |
+| `STOP_ATR_MULT` | 2.5 | stop distance = this x the 14-day ATR %, clamped to 5-15% |
+| `STOP_PCT` | 10 | stop distance for a stock with no ATR |
 | `STOP_CHECK_MINUTES` | 15 | intraday check interval |
 | `RUN_TIME` | 16:10 | daily run, IST |
 | `PICKS_REFRESH_WEEKDAY` | 0 | 0 = Monday |
@@ -62,3 +63,15 @@ python -m pytest tests
 ```
 
 Offline: synthetic prices drive the real engine code, no Dhan or network needed.
+
+## Stop rule (no fixed target)
+
+The engine's backtest found fixed targets with tight stops destroyed the returns of these 90-day momentum picks, so
+there is no exit target. Each pick gets a volatility-based stop that only rises (`stops.py`):
+
+- distance = 2.5 x ATR% (14-day average true range / close), clamped to 5-15%
+- picks table: stop = price x (1 - distance), and the 2R level = price x (1 + 2 x distance)
+- holdings: stop = highest daily close since the holding was first seen x (1 - distance), never lowered; once a
+  close reaches the 2R level the stop is at least the buy price. Only daily closes move the high; the intraday
+  check compares the live price with the stored stop. HOLDINGS has no buy date, so the trail starts from the buy
+  price on the first run that sees the holding.

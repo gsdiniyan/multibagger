@@ -26,6 +26,8 @@ import dhan_client as dc
 
 HISTORY_YEARS = 3.3  # screener needs ~2y of lookback plus room
 JUMP = 0.15
+ATR_BARS = 14
+ATR_SKIP = 0.25  # a bar whose range is over 25% of the close is a split / bonus in Dhan's unadjusted prices, not volatility
 
 
 @dataclass
@@ -36,6 +38,7 @@ class PriceStore:
     missing: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     excluded: list[str] = field(default_factory=list)
+    atr_pct: dict[str, float] = field(default_factory=dict)  # bare symbol -> 14-day average true range, as a fraction of the close
 
     @property
     def last_date(self) -> pd.Timestamp:
@@ -55,6 +58,22 @@ def _fetch_one(symbol: str) -> tuple[str, pd.DataFrame | None]:
             return symbol, _ist_fix(df)
         time.sleep(1.5 * (attempt + 1))  # Dhan answers 429 with no body; back off and retry
     return symbol, None
+
+
+def atr_pct(df: pd.DataFrame, bars: int = ATR_BARS) -> float | None:
+    """Average true range of the last `bars` daily bars as a fraction of the close (0.02 = 2%). Each bar's true range
+    is divided by its own close, so an unadjusted split earlier in the window does not distort it; bars with a
+    range above ATR_SKIP are skipped as corporate actions."""
+    if df is None or not {"High", "Low", "Close"} <= set(df.columns):
+        return None
+    d = df[["High", "Low", "Close"]].dropna()
+    prev = d["Close"].shift(1)
+    tr = pd.concat([d["High"] - d["Low"], (d["High"] - prev).abs(), (d["Low"] - prev).abs()], axis=1).max(axis=1)
+    ratio = (tr / d["Close"]).iloc[1:]
+    ratio = ratio[(ratio > 0) & (ratio <= ATR_SKIP)].tail(bars)
+    if len(ratio) < bars // 2:
+        return None
+    return round(float(ratio.mean()), 5)
 
 
 def _fix_splits(close: pd.DataFrame, warnings: list[str]) -> set[str]:
@@ -131,7 +150,8 @@ def fetch_all(symbols: list[str], workers: int = 2, sleep=time.sleep) -> PriceSt
     excluded = sorted(_fix_splits(close, warnings))
     close = close.drop(columns=excluded, errors="ignore")
     volume = volume.drop(columns=excluded, errors="ignore")
-    return PriceStore(close, volume, datetime.now().isoformat(timespec="seconds"), missing, warnings, excluded)
+    atr = {t.replace(".NS", ""): a for t, df in ok.items() if (a := atr_pct(df)) is not None}
+    return PriceStore(close, volume, datetime.now().isoformat(timespec="seconds"), missing, warnings, excluded, atr)
 
 
 def live_prices(symbols: list[str]) -> dict[str, float]:

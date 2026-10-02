@@ -16,7 +16,7 @@ except Exception:                             # pragma: no cover - the ledger is
     LedgerClient = None
 
 SOURCE = "diamond-stock-picks"
-RULE_VERSION = "diamond-stock-picks-v1"       # bump when the engine strategies or the stop rule change
+RULE_VERSION = "diamond-stock-picks-v2"       # bump when the engine strategies or the stop rule change (v2: 2.5x ATR trailing stop)
 STRATEGY_NAMES = {"steady": "diamond_stock_steady", "gods_plan": "diamond_stock_gods_plan"}
 
 _ledger = None
