@@ -65,6 +65,24 @@ def _headers() -> dict:
     }
 
 
+# Only what the lookups in this codebase read. The full file is ~200k rows x 33 columns (~80 MB once loaded, and
+# _master() keeps it cached for the life of the process, which is what Railway bills); these 11 columns, NSE's equity, index,
+# futures and option rows, and BSE's index rows (SENSEX, BANKEX) and their futures and options are about a fifth of
+# it. Currency, commodity (MCX), option-on-futures and BSE stock rows are never looked up here. test_master_trim.py checks every lookup gives the same answer as the full file.
+MASTER_COLUMNS = ("EXCH_ID", "SEGMENT", "SECURITY_ID", "INSTRUMENT", "UNDERLYING_SYMBOL", "SYMBOL_NAME", "SERIES",
+                  "LOT_SIZE", "SM_EXPIRY_DATE", "STRIKE_PRICE", "OPTION_TYPE")
+MASTER_ROWS = {"NSE": ("EQUITY", "INDEX", "FUTIDX", "FUTSTK", "OPTIDX", "OPTSTK"),
+               "BSE": ("INDEX", "FUTIDX", "OPTIDX")}
+
+
+def _read_master(path=None) -> pd.DataFrame:
+    df = pd.read_csv(path or _MASTER_CACHE_PATH, low_memory=False, usecols=lambda c: c in MASTER_COLUMNS)
+    keep = pd.Series(False, index=df.index)
+    for exch, instruments in MASTER_ROWS.items():
+        keep |= (df["EXCH_ID"] == exch) & df["INSTRUMENT"].isin(instruments)
+    return df[keep]
+
+
 @lru_cache(maxsize=1)
 def _master() -> pd.DataFrame:
     use_cache = (
@@ -72,11 +90,11 @@ def _master() -> pd.DataFrame:
         and (time.time() - _MASTER_CACHE_PATH.stat().st_mtime) < _MASTER_CACHE_TTL_HOURS * 3600
     )
     if use_cache:
-        return pd.read_csv(_MASTER_CACHE_PATH, low_memory=False)
+        return _read_master()
     r = requests.get(SCRIP_MASTER_URL, timeout=60)
     r.raise_for_status()
     _MASTER_CACHE_PATH.write_bytes(r.content)
-    return pd.read_csv(_MASTER_CACHE_PATH, low_memory=False)
+    return _read_master()
 
 
 @lru_cache(maxsize=1)
