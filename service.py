@@ -52,6 +52,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
@@ -312,6 +313,55 @@ def _diff_picks(today: list[dict], previous: list[dict]) -> dict:
     return {"new": new, "dropped": dropped, "moved": moved, "has_previous": True}
 
 
+# Current price for the dashboard's "Current" column: one Dhan batch quote for the top picks, at most once a minute,
+# and only while NSE is open (09:15-15:30 IST weekdays). Outside those hours the last quote read stays, so after the
+# close it shows the session's last traded price.
+LIVE_SECONDS = 60.0
+_live_lock = threading.Lock()
+_live: dict = {"at": None, "fetched": 0.0, "prices": {}}
+
+
+def _market_hours(now: datetime) -> bool:
+    return now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) <= (15, 30)
+
+
+def _fetch_quotes(symbols: list) -> dict:
+    """{SYMBOL: {"ltp", "prev_close"}} from Dhan's /marketfeed/quote (up to 1000 names a call). {} on any failure."""
+    sys.path.insert(0, str(BASE_DIR / "src"))
+    from src import dhan_client as dc
+    import requests
+    ids = dc._security_id_map()
+    by_id = {int(ids[s]): s for s in symbols if s in ids}
+    if not by_id:
+        return {}
+    r = requests.post(f"{dc.DHAN_BASE_URL}/marketfeed/quote", json={"NSE_EQ": list(by_id)}, headers=dc._headers(), timeout=8)
+    r.raise_for_status()
+    out = {}
+    for sid, leg in ((r.json().get("data") or {}).get("NSE_EQ") or {}).items():
+        sym, ltp = by_id.get(int(sid)), float(leg.get("last_price") or 0)
+        if sym and ltp > 0:
+            out[sym] = {"ltp": ltp, "prev_close": float((leg.get("ohlc") or {}).get("close") or 0) or None}
+    return out
+
+
+def _live_prices(symbols: list, now: Optional[datetime] = None, fetch=None) -> dict:
+    """{"at": ISO time of the quote or None, "prices": {SYMBOL: {"ltp", "prev_close"}}}. Never raises."""
+    now = now or _ist_now()
+    with _live_lock:
+        stale = time.monotonic() - _live["fetched"] > LIVE_SECONDS
+        missing = any(s not in _live["prices"] for s in symbols)
+        if _market_hours(now) and (stale or missing) and symbols:
+            try:
+                got = (fetch or _fetch_quotes)(symbols)
+                if got:
+                    _live["prices"].update(got)
+                    _live["at"] = now.isoformat(timespec="seconds")
+            except Exception as e:
+                print(f"live prices unavailable: {type(e).__name__}: {e}")
+            _live["fetched"] = time.monotonic()        # a failure also waits a minute: Dhan's quote limit is shared
+        return {"at": _live["at"], "prices": dict(_live["prices"])}
+
+
 def _build_status() -> dict:
     run_state = _load_run_state()
     notes: list[str] = []
@@ -353,6 +403,14 @@ def _build_status() -> dict:
         t = (tracked.get("picks") or {}).get(p.get("symbol")) or {}
         p.update({k: t.get(k) for k in ("stop", "two_r", "risk_pct", "atr_pct", "status", "status_at", "list_price",
                                           "list_date", "trail_stop", "since_list_pct", "last_close")})
+    live = _live_prices([p.get("symbol") for p in top_picks if p.get("symbol")])
+    for p in top_picks:                        # current price: the live quote, else the last tracked close
+        q = live["prices"].get(p.get("symbol"))
+        if q:
+            p["now_price"] = round(q["ltp"], 2)
+            p["day_chg_pct"] = round((q["ltp"] / q["prev_close"] - 1) * 100, 2) if q.get("prev_close") else None
+        else:
+            p["now_price"], p["day_chg_pct"] = p.get("last_close"), None
 
     return {
         "project": "Multibagger",
@@ -367,6 +425,7 @@ def _build_status() -> dict:
         "top_picks": top_picks,
         "changes": _diff_picks(top_picks, previous_picks),
         "tracking_as_of": tracked.get("day"),
+        "live_at": live["at"],
         "stop_rule": (f"{tracking.stops.ATR_MULT}x ATR below the price ({tracking.stops.MIN_DIST:.0%}-"
                       f"{tracking.stops.MAX_DIST:.0%}); status trails the highest close since a pick joined the list"),
     }
