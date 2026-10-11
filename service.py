@@ -16,7 +16,9 @@ WHAT THIS SERVICE DOES
      (default 18:00 IST - after the 15:30 NSE close, technicals want a
      completed day's candle; fundamentals from screener.in barely move
      intraday anyway, so once a day is plenty and keeps scraping load
-     low).
+     low). Only on days NSE traded: a weekend or holiday 18:00 run is
+     skipped, and a startup run on such a day fills /status but writes
+     nothing to the trading ledger (see _market_traded_today).
   2. Serves GET /status - JSON built from whatever main.py's own pipeline
      last wrote (final.csv if technicals succeeded, else scored.csv,
      else raw_data.csv's error breakdown) - for trading-dashboard's own
@@ -95,7 +97,7 @@ def _snapshot_previous_picks() -> None:
             return
 
 
-def _run_scan() -> None:
+def _run_scan(record: bool = True) -> None:
     """Runs main.py exactly as a human would from the command line, then
     records the outcome. Never raises - a scan that crashes is recorded
     as a failed run, not a dead service (the scheduler loop below keeps
@@ -132,8 +134,10 @@ def _run_scan() -> None:
     except Exception as e:
         print(f"Failed to write run_state.json: {e}")
     print(f"[{finished.isoformat()}] Scan finished, process_ok={ok}")
-    if ok:
+    if ok and record:
         _track_and_record(finished)
+    elif ok:
+        print("market did not trade today: picks shown, nothing tracked or sent to the ledger")
 
 
 LEDGER_SOURCE = "multibagger-screener"
@@ -195,12 +199,52 @@ def _seconds_until_next_run() -> float:
     return (target - now).total_seconds()
 
 
+# The scan used to run every day at 18:00, weekends and holidays included. On 2026-10-02 (Gandhi Jayanti, market shut)
+# a deploy's startup run sent 10 BUY signals to the ledger dated a day nothing could be bought.
+MARKET_PROBES = ("RELIANCE", "HDFCBANK", "INFY")
+
+
+def _market_traded_today(today) -> bool:
+    """True when one of a few large NSE stocks shows a trade dated today. A weekend is closed without asking. If the
+    quote itself fails on a weekday, the day counts as open (a Dhan hiccup must not skip a real session); a quote that
+    answers with the last session's trades closes it."""
+    if today.weekday() >= 5:
+        return False
+    stamps, err = None, None
+    for attempt in range(3):                 # the quote endpoint allows 1 call a second, shared with the other services
+        try:
+            sys.path.insert(0, str(BASE_DIR / "src"))
+            from src import dhan_client as dc
+            import requests
+            ids = dc._security_id_map()
+            sids = [int(ids[s]) for s in MARKET_PROBES if s in ids]
+            r = requests.post(f"{dc.DHAN_BASE_URL}/marketfeed/quote", json={"NSE_EQ": sids}, headers=dc._headers(), timeout=15)
+            r.raise_for_status()
+            stamps = [str(leg.get("last_trade_time") or "") for leg in ((r.json().get("data") or {}).get("NSE_EQ") or {}).values()]
+            break
+        except Exception as e:
+            err = e
+            time.sleep(1.5 * (attempt + 1))
+    if stamps is None:
+        print(f"(market-open check failed: {type(err).__name__}: {err}; a weekday, so it counts as open)")
+        return True
+    if not any(stamps):
+        print("(market-open check: the quote carried no trade times; a weekday, so it counts as open)")
+        return True
+    return any(st.startswith(today.strftime("%d/%m/%Y")) for st in stamps)
+
+
 def _scheduler_loop() -> None:
-    _run_scan()  # immediate first run, so a fresh deploy isn't blank for up to 24h
+    # immediate first run, so a fresh deploy isn't blank for up to 24h; the ledger only hears about it on a trading day
+    _run_scan(record=_market_traded_today(_ist_now().date()))
     while True:
         wait_s = _seconds_until_next_run()
         print(f"Next scan in {wait_s / 3600:.1f}h (at {RUN_HOUR_IST:02d}:00 IST)")
         time.sleep(wait_s)
+        today = _ist_now().date()
+        if not _market_traded_today(today):
+            print(f"[{_ist_now().isoformat()}] NSE did not trade today ({today:%a %d %b %Y}): no scan")
+            continue
         _run_scan()
 
 
